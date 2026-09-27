@@ -3,7 +3,7 @@
 OpenNR is a ReShade add-on that runs a small neural network on your game's picture, every frame.
 It re-balances local tone, local contrast and colour for a more natural, photographic look.
 
-Version 0.1.0 — the first release.
+Version 0.1.1.
 
 ## What you need
 
@@ -19,7 +19,7 @@ ReShade with add-on support is not meant for online games with anti-cheat. Don't
 ## Install
 
 1. Install ReShade **with full add-on support** into your game, if you haven't already.
-2. Download `OpenNR-0.1.0.zip` from [Releases](https://github.com/MakeDecisionWorth/OpenNR-ReShade/releases)
+2. Download the latest `OpenNR-<version>.zip` from [Releases](https://github.com/MakeDecisionWorth/OpenNR-ReShade/releases)
    and extract it.
 3. Right-click `install.ps1` → **Run with PowerShell**. When it asks, drag the game's `.exe` (the
    one ReShade is installed next to) into the window and press Enter.
@@ -37,7 +37,7 @@ To install by hand instead, copy `opennr.addon64` and the `OpenNR` folder next t
 | **Strength** | How much of the correction is applied. 0% leaves the picture as it was. |
 | **Local Tone Strength** | Mostly affects colour. |
 | **Local Structure Strength** | Mostly affects local contrast. 10–100% gives the most predictable results for both of these. |
-| **Model A / B / C** | A: neutral. B: slightly darker (−0.1 EV), −25% contrast, −10% saturation. C: −15% saturation. B and C follow Local Tone, up to 100%. |
+| **Model A / B / C** | A: neutral. B: slightly darker (−0.1 EV), −25% contrast, −10% saturation. C: −15% saturation. B and C follow Local Tone, up to 100%. With **2 passes** the correction itself also changes with the model; with **1 pass** only the colour grade does. |
 | **Correction Model** | **1 pass** or **2 passes**. 2 passes is a stronger and differently shaped correction, not simply more of the same. Both cost the same. |
 | **View** | **Final frame** is the normal picture. **Correction ×20** shows what OpenNR changes, magnified: mid-grey is unchanged, brighter is added, darker is taken away. **Source** shows the picture exactly as OpenNR reads it. |
 | **Depth buffer** | Information only; OpenNR doesn't use depth. If it says *REJECTED*, ReShade's depth detection picked something that isn't the scene (a shadow map or a mirror). In the Generic Depth settings, set "Aspect ratio heuristic" to "Similar aspect ratio". |

@@ -5,7 +5,7 @@ Windows SDK and `fxc`), and three things under `ext\` (not part of this reposito
 
 | Path | What | From |
 |---|---|---|
-| `ext\reshade\include` | the ReShade add-on SDK headers | [crosire/reshade](https://github.com/crosire/reshade), `include\` (0.1.0 was built with commit `3645e30`, add-on API version 20) |
+| `ext\reshade\include` | the ReShade add-on SDK headers | [crosire/reshade](https://github.com/crosire/reshade), `include\` (0.1.1 was built with commit `3645e30`, add-on API version 20) |
 | `ext\imgui` | Dear ImGui headers, at the version the SDK pins (1.92.5 for the commit above) | the reshade repository's `deps\imgui` submodule |
 | `ext\dxc` | *optional*: DXC with SPIR-V support, for Vulkan | the official [DirectXShaderCompiler release](https://github.com/microsoft/DirectXShaderCompiler/releases) (Windows zip, extracted as is). Without it the add-on builds without Vulkan support. |
 

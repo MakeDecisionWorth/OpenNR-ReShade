@@ -38,7 +38,7 @@ using namespace reshade::api;
 
 namespace {
 
-constexpr const char* kVersion = "0.1.0";
+constexpr const char* kVersion = "0.1.1";
 
 // The network's resolution: at least 320 and a multiple of 64 on each side.
 uint32_t align_extent(uint32_t n) {

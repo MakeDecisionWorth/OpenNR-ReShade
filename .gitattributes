@@ -1,0 +1,2 @@
+# model weights are binary whatever their bytes happen to look like
+*.bin binary

@@ -1,0 +1,10 @@
+# build inputs and outputs
+ext/
+build/
+dist/
+src/opennr_spirv.hpp
+*.obj
+*.exp
+*.lib
+*.addon64
+*.log

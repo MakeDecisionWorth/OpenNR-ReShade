@@ -44,7 +44,7 @@ using namespace reshade::api;
 
 namespace {
 
-constexpr const char* kVersion = "0.2.0";
+constexpr const char* kVersion = "0.2.1";
 
 // The network's resolution: at least 320 and a multiple of 64 on each side.
 uint32_t align_extent(uint32_t n) {
@@ -662,7 +662,8 @@ void on_begin_effects(effect_runtime* rt, command_list*, resource_view, resource
 // The large model OpenNR's own models are trained to imitate, run by the OpenNR teacher bridge --
 // a separate program on this PC. The frame goes to it through shared memory and its output comes
 // back to the same composite OpenNR's model uses, so the two differ in the network and in nothing
-// else. The game waits for every frame.
+// else. With protocol 2 the game waits for every frame; with protocol 3 (below), which a bridge
+// from version 0.1.1 on offers and which is then used, it does not.
 //
 // Nothing waits for a bridge that is not demonstrably alive: without one, or when it stalls, the
 // frame is corrected by OpenNR's own model and the overlay says why, in red.
@@ -707,19 +708,19 @@ inline bool process_alive(DWORD pid) {
     return alive;
 }
 
-// 0: this process holds the teacher now; otherwise the id of the process that does
-inline DWORD claim(Header* h) {
+// 0: this process holds the teacher now; otherwise the id of the process that does. Both
+// protocols keep their owner the same way.
+inline DWORD claim(volatile uint32_t* owner) {
     const LONG me = LONG(GetCurrentProcessId());
-    auto* o = reinterpret_cast<volatile LONG*>(&h->owner);
+    auto* o = reinterpret_cast<volatile LONG*>(owner);
     const LONG cur = InterlockedCompareExchange(o, me, 0);
     if (cur == 0 || cur == me) return 0;
     if (!process_alive(DWORD(cur)) && InterlockedCompareExchange(o, me, cur) == cur) return 0;
     return DWORD(cur);
 }
 
-inline void release(Header* h) {
-    InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(&h->owner), 0,
-                               LONG(GetCurrentProcessId()));
+inline void release(volatile uint32_t* owner) {
+    InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(owner), 0, LONG(GetCurrentProcessId()));
 }
 
 // the program's file name, for the overlay
@@ -737,11 +738,70 @@ inline void process_name(DWORD pid, char* out, size_t n) {
 }
 }  // namespace teacher
 
+// Protocol 3, which the bridge offers from version 0.1.1 on and which is used whenever it is there.
+// The game does not wait: a frame is copied out and handed over as often as the bridge's GPUs
+// together can take one, each on its own, and every frame handed over is kept here until its
+// output comes back -- then it is shown with that output, and stays on screen until a newer one
+// is ready. An output that comes back after a newer one is dropped. So what is shown is exact,
+// a little behind the game, and changes as often as the teacher finishes a frame.
+//
+// Four slots carry the frames over and the outputs back. A slot goes FREE -> WRITING -> FILLED
+// (here) -> CLAIMED -> DONE (one of the bridge's GPUs) -> READING -> FREE (here); the settings
+// carry a generation this side bumps when they change, and the bridge restarts on it.
+namespace teacher3 {
+constexpr const char* kName = "Local\\OpenNR_Teacher3";
+constexpr uint32_t kMagic = 0x33524E4Fu;    // 'ONR3'
+constexpr uint32_t kVersion = 3;
+constexpr uint32_t kSlots = 4;
+constexpr uint64_t kHdr = 4096;
+constexpr uint64_t kInMax = 3840ull * 2160 * 4;
+constexpr uint64_t kOutMax = 2176ull * 3840 * 8;
+constexpr uint64_t kSize = kHdr + kSlots * (kInMax + kOutMax);
+constexpr uint32_t kFree = 0, kWriting = 1, kFilled = 2, kClaimed = 3, kDone = 4, kReading = 5;
+constexpr uint32_t kAbsent = 0, kReady = 1, kLoading = 2;   // the bridge's state
+
+// the bridge holds the other half of this layout, as byte offsets
+struct Slot {                                     // 64 bytes
+    volatile uint32_t state;                      // 0
+    volatile uint32_t seq;                        // 4   the frame's number here, from 1
+    volatile uint32_t worker;                     // 8
+    uint32_t key_gen;                             // 12  the settings it was written under
+    uint32_t ow, oh, fmt, pitch;                  // 16 .. 28  fmt: 0 RGBA8, 1 BGRA8
+    float ms;                                     // 32
+    uint32_t t_filled, t_done;                    // 36, 40
+    uint32_t pad[5];                              // 44
+};
+static_assert(sizeof(Slot) == 64, "the bridge reads this at fixed offsets");
+
+struct Header {
+    uint32_t magic, version;                      // 0
+    volatile uint32_t owner;                      // 8   the process using the teacher; 0: none
+    volatile uint32_t key_gen;                    // 12
+    uint32_t ow, oh, nw, nh, tone, structure;     // 16 .. 36  the settings
+    volatile uint32_t state;                      // 40
+    volatile uint32_t heartbeat;                  // 44
+    volatile float pace_ms;                       // 48  how often to hand over a frame
+    volatile uint32_t nworkers;                   // 52  GPUs ready for frames
+    uint32_t pad0[2];                             // 56
+    char status[128];                             // 64
+    Slot slots[kSlots];                           // 192
+    uint8_t rest[kHdr - 192 - kSlots * sizeof(Slot)];   // the bridge's own, from 448
+};
+static_assert(sizeof(Header) == kHdr, "the bridge reads this at fixed offsets");
+
+inline uint8_t* in_slot(Header* h, uint32_t k) {
+    return reinterpret_cast<uint8_t*>(h) + kHdr + uint64_t(k) * kInMax;
+}
+inline const uint8_t* out_slot(Header* h, uint32_t k) {
+    return reinterpret_cast<uint8_t*>(h) + kHdr + uint64_t(kSlots) * kInMax + uint64_t(k) * kOutMax;
+}
+inline bool cas(volatile uint32_t* p, uint32_t from, uint32_t to) {
+    return uint32_t(InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(p), LONG(to),
+                                               LONG(from))) == from;
+}
+}  // namespace teacher3
+
 enum BridgeState : int { kBridgeAbsent, kBridgeStopped, kBridgeLoading, kBridgeReady };
-// The overlay's Experimental section exists only with `Experimental=1` under [OpenNR] in
-// ReShade.ini, read at startup; without it everything in the section is off, whatever else the
-// file says.
-uint32_t g_experimental = 0;
 uint32_t g_teacher = 0;                        // Use the teacher model; saved as "Teacher"
 std::atomic<int> g_bridge{kBridgeAbsent};      // as of the last poll
 char g_bridge_status[160] = "";                // the bridge's own line while it starts
@@ -752,46 +812,79 @@ std::atomic<bool> g_teacher_ready{false};
 std::atomic<bool> g_teacher_active{false};     // the last frame's output came from the teacher
 char g_teacher_note[160] = "";                 // why it did not, when it did not
 double g_teacher_ms = 0.0, g_teacher_wall = 0.0;
-HANDLE g_tmap = nullptr;
+std::atomic<int> g_proto{3};                   // the protocol the bridge offers: 3, or 2 without it
+HANDLE g_tmap = nullptr, g_t3map = nullptr;
 uint8_t* g_tview = nullptr;
+uint8_t* g_t3view = nullptr;
 
-teacher::Header* teacher_header() {
-    if (!g_tview) {
-        // opened, never created: the bridge owns the mapping. Tried once a second, so a bridge
-        // started after the game is found without a restart.
-        static ULONGLONG next_try = 0;
-        if (GetTickCount64() < next_try) return nullptr;
-        next_try = GetTickCount64() + 1000;
-        g_tmap = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, teacher::kName);
-        if (!g_tmap) return nullptr;
-        g_tview = static_cast<uint8_t*>(MapViewOfFile(g_tmap, FILE_MAP_ALL_ACCESS, 0, 0, teacher::kSize));
-        if (!g_tview) {
-            CloseHandle(g_tmap);
-            g_tmap = nullptr;
-            return nullptr;
-        }
+// Opened, never created: the bridge owns the mapping. Tried once a second, so a bridge started
+// after the game is found without a restart.
+uint8_t* open_bridge(const char* name, uint64_t size, HANDLE& map, uint8_t*& view, ULONGLONG& next_try) {
+    if (view) return view;
+    if (GetTickCount64() < next_try) return nullptr;
+    next_try = GetTickCount64() + 1000;
+    map = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, name);
+    if (!map) return nullptr;
+    view = static_cast<uint8_t*>(MapViewOfFile(map, FILE_MAP_ALL_ACCESS, 0, 0, size));
+    if (!view) {
+        CloseHandle(map);
+        map = nullptr;
     }
-    auto* h = reinterpret_cast<teacher::Header*>(g_tview);
-    return (h->magic == teacher::kMagic && h->version == teacher::kVersion) ? h : nullptr;
+    return view;
 }
 
-// At present, while the teacher is switched on or the overlay is open. The mapping outlives a
-// bridge that exited -- this process holds it open -- so its heartbeat is the proof of life.
+teacher::Header* teacher_header() {
+    static ULONGLONG next_try = 0;
+    auto* h = reinterpret_cast<teacher::Header*>(
+        open_bridge(teacher::kName, teacher::kSize, g_tmap, g_tview, next_try));
+    return (h && h->magic == teacher::kMagic && h->version == teacher::kVersion) ? h : nullptr;
+}
+
+teacher3::Header* teacher3_header() {
+    static ULONGLONG next_try = 0;
+    auto* h = reinterpret_cast<teacher3::Header*>(
+        open_bridge(teacher3::kName, teacher3::kSize, g_t3map, g_t3view, next_try));
+    return (h && h->magic == teacher3::kMagic && h->version == teacher3::kVersion) ? h : nullptr;
+}
+
+// The teacher switched off, or the game closing: the bridge is free for another program.
+void teacher_release_all() {
+    if (g_tview) teacher::release(&reinterpret_cast<teacher::Header*>(g_tview)->owner);
+    if (g_t3view) teacher::release(&reinterpret_cast<teacher3::Header*>(g_t3view)->owner);
+}
+
+// At present, while the teacher is switched on or the overlay is open. Protocol 3 when the bridge
+// offers it, protocol 2 otherwise. A mapping outlives a bridge that exited -- this process holds it
+// open -- so its heartbeat is the proof of life.
 void bridge_poll() {
-    teacher::Header* h = teacher_header();
-    if (!h) { g_bridge = kBridgeAbsent; return; }
-    static uint32_t last = 0;
-    static ULONGLONG seen = 0;
     const ULONGLONG now = GetTickCount64();
-    if (h->heartbeat != last) { last = h->heartbeat; seen = now; }
-    if (h->state == teacher::kAbsent) { g_bridge = kBridgeAbsent; return; }
-    if (now - seen >= 1500) { g_bridge = kBridgeStopped; return; }
-    if (h->state == teacher::kLoading) {
-        std::snprintf(g_bridge_status, sizeof g_bridge_status, "%.127s", h->status);
-        g_bridge = kBridgeLoading;
-        return;
+    auto look = [&](uint32_t heartbeat, uint32_t state, const char* status, uint32_t& last,
+                    ULONGLONG& seen) {
+        if (heartbeat != last) { last = heartbeat; seen = now; }
+        if (state == teacher::kAbsent) return kBridgeAbsent;
+        if (now - seen >= 1500) return kBridgeStopped;
+        if (state == teacher::kLoading) {
+            std::snprintf(g_bridge_status, sizeof g_bridge_status, "%.127s", status);
+            return kBridgeLoading;
+        }
+        return kBridgeReady;
+    };
+    int b3 = kBridgeAbsent, b2 = kBridgeAbsent;
+    if (teacher3::Header* h = teacher3_header()) {
+        static uint32_t last = 0;
+        static ULONGLONG seen = 0;
+        b3 = look(h->heartbeat, h->state, h->status, last, seen);
     }
-    g_bridge = kBridgeReady;
+    if (b3 == kBridgeAbsent || b3 == kBridgeStopped)
+        if (teacher::Header* h = teacher_header()) {
+            static uint32_t last = 0;
+            static ULONGLONG seen = 0;
+            b2 = look(h->heartbeat, h->state, h->status, last, seen);
+        }
+    auto up = [](int b) { return b == kBridgeReady || b == kBridgeLoading; };
+    const bool two = !up(b3) && (up(b2) || (b3 == kBridgeAbsent && b2 == kBridgeStopped));
+    g_proto = two ? 2 : 3;
+    g_bridge = two ? b2 : b3;
 }
 
 bool ensure_teacher_resources(device* d, uint32_t OW, uint32_t OH, format f) {
@@ -847,8 +940,8 @@ uint32_t teacher_format(format f) {
 // Everything that can be decided without touching the GPU, so a frame that falls back costs
 // nothing.
 bool teacher_wanted(device* d, uint32_t OW, uint32_t OH, format f) {
-    if (!g_teacher || !g_experimental) {
-        if (g_tview) teacher::release(reinterpret_cast<teacher::Header*>(g_tview));
+    if (!g_teacher || g_proto != 2) {
+        if (g_tview) teacher::release(&reinterpret_cast<teacher::Header*>(g_tview)->owner);
         return false;
     }
     const char* why = nullptr;
@@ -857,7 +950,7 @@ bool teacher_wanted(device* d, uint32_t OW, uint32_t OH, format f) {
     else if (g_bridge == kBridgeAbsent || !h)         why = "the teacher bridge is not running";
     else if (g_bridge == kBridgeStopped)              why = "the teacher bridge stopped responding";
     else if (g_bridge == kBridgeLoading)              why = "the teacher bridge is still starting";
-    else if (const DWORD other = teacher::claim(h)) {
+    else if (const DWORD other = teacher::claim(&h->owner)) {
         static char in_use[160];
         char name[MAX_PATH];
         teacher::process_name(other, name, sizeof name);
@@ -936,6 +1029,333 @@ bool teacher_exchange(device* d, command_list* cmd, uint32_t OW, uint32_t OH, fo
     g_teacher_ms = h->teacher_ms;
     g_teacher_wall = double(GetTickCount64() - t0);
     return true;
+}
+
+// ---------------------------------------------------------- protocol 3: the game does not wait
+double now_ms() {
+    static LARGE_INTEGER f = [] { LARGE_INTEGER x; QueryPerformanceFrequency(&x); return x; }();
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return double(c.QuadPart) * 1000.0 / double(f.QuadPart);
+}
+
+struct Teacher3 {
+    // the frames kept for their outputs: one on screen, and one for each of the bridge's slots and
+    // the one on its way to the CPU
+    static constexpr uint32_t R = 6;
+    uint32_t w = 0, h = 0, ow = 0, oh = 0;
+    format send_fmt = format::unknown, keep_fmt = format::unknown;
+    bool ok = false, tried = false;
+
+    resource gstage[R] = {};                 // what the bridge is sent, on its way to the CPU
+    resource frame[R] = {};                  // the frame itself, kept until its output comes back
+    resource_view frame_srv[R] = {};
+    resource head = {};                      // the output of the frame on screen, one uint2 a pixel
+    resource_view head_srv = {};
+    uint32_t seq_of[R] = {};                 // the frame each of these holds; 0: none
+    double sent_at[R] = {};
+    int shown = -1;                          // the one on screen
+    int pending = -1;                        // copied out last frame, to hand over now
+    uint32_t last_shown = 0, next_seq = 0, key_gen = 0;
+    double last_submit = 0.0, last_show = 0.0;
+    double behind_ms = 0.0, every_ms = 0.0;  // for the overlay
+    uint32_t gpus = 0;
+    // D3D12: a readback is mapped only once this fence says it has landed
+    device_api api = device_api::d3d11;
+    fence fnc = {};
+    uint64_t fval = 0, fv[R] = {};
+    int unsignaled = -1;
+
+    int ring_of(uint32_t seq) const {
+        for (uint32_t q = 0; q < R; ++q)
+            if (seq_of[q] == seq) return int(q);
+        return -1;
+    }
+
+    void forget_frames() {
+        for (uint32_t q = 0; q < R; ++q) seq_of[q] = 0;
+        shown = pending = -1;
+        last_shown = 0;
+        behind_ms = every_ms = 0.0;
+        last_show = last_submit = 0.0;
+    }
+
+    void destroy(device* d) {
+        if (api != device_api::d3d11 && (fnc.handle || gstage[0].handle) && g_rt &&
+            g_rt->get_device() == d)
+            if (command_queue* q = g_rt->get_command_queue()) q->wait_idle();
+        if (fnc.handle) { d->destroy_fence(fnc); fnc = {}; }
+        fval = 0;
+        unsignaled = -1;
+        for (uint32_t k = 0; k < R; ++k) {
+            fv[k] = 0;
+            if (frame_srv[k].handle) { d->destroy_resource_view(frame_srv[k]); frame_srv[k] = {}; }
+            for (resource* r : {&gstage[k], &frame[k]})
+                if (r->handle) { g.forget(*r); d->destroy_resource(*r); *r = {}; }
+        }
+        if (head_srv.handle) { d->destroy_resource_view(head_srv); head_srv = {}; }
+        if (head.handle) { g.forget(head); d->destroy_resource(head); head = {}; }
+        forget_frames();
+        ok = false;
+    }
+
+    bool fail(const char* why) {
+        std::snprintf(g_teacher_note, sizeof g_teacher_note, "%s", why);
+        reshade::log::message(reshade::log::level::error, (std::string("OpenNR: teacher: ") + why).c_str());
+        return false;
+    }
+
+    // `sf`: what the bridge is sent (the frame, or on HDR the frame as the network is shown it);
+    // `kf`: the frame kept for the composite
+    bool build(device* d, uint32_t W, uint32_t H, uint32_t OW, uint32_t OH, format sf, format kf) {
+        destroy(d);
+        w = W; h = H; ow = OW; oh = OH; send_fmt = sf; keep_fmt = kf;
+        tried = true;
+        api = d->get_api();
+        if (api == device_api::d3d12 && !d->create_fence(0, fence_flags::none, &fnc))
+            return fail("could not set up the frame copy");
+        for (uint32_t k = 0; k < R; ++k) {
+            if (!d->create_resource(resource_desc(OW, OH, 1, 1, sf, 1, memory_heap::gpu_to_cpu,
+                                                  resource_usage::copy_dest),
+                                    nullptr, resource_usage::copy_dest, &gstage[k]))
+                return fail("could not set up the frame copy");
+            if (!d->create_resource(resource_desc(OW, OH, 1, 1, kf, 1, memory_heap::gpu_only,
+                                                  resource_usage::shader_resource |
+                                                      resource_usage::copy_dest |
+                                                      resource_usage::copy_source),   // Save views
+                                    nullptr, resource_usage::shader_resource, &frame[k]) ||
+                !d->create_resource_view(frame[k], resource_usage::shader_resource,
+                                         resource_view_desc(format_to_default_typed(kf)), &frame_srv[k]))
+                return fail("could not set up the kept frames");
+        }
+        const uint64_t np = uint64_t(W) * H;
+        resource_desc rd(np * 8, memory_heap::gpu_only,
+                         resource_usage::shader_resource | resource_usage::copy_dest |
+                             resource_usage::copy_source);                            // Save views
+        rd.buffer.structured.stride = 8;
+        resource_view_desc vd{};
+        vd.type = resource_view_type::buffer;
+        vd.format = format::unknown;
+        vd.buffer.offset = 0;
+        vd.buffer.structured.count = uint32_t(np);
+        vd.buffer.structured.stride = 8;
+        if (!d->create_resource(rd, nullptr, resource_usage::shader_resource, &head) ||
+            !d->create_resource_view(head, resource_usage::shader_resource, vd, &head_srv))
+            return fail("could not set up the output buffer");
+        for (uint32_t k = 0; k < R; ++k) {
+            g.track(gstage[k], resource_usage::copy_dest);
+            g.track(frame[k], resource_usage::shader_resource);
+        }
+        g.track(head, resource_usage::shader_resource);
+        ok = true;
+        return true;
+    }
+
+    // Is frame `seq` still with the bridge -- waiting, being worked on, or done?
+    bool with_bridge(const teacher3::Header* hd, uint32_t seq) const {
+        for (uint32_t s = 0; s < teacher3::kSlots; ++s) {
+            const teacher3::Slot& sl = hd->slots[s];
+            if (sl.state != teacher3::kFree && sl.seq == seq && sl.key_gen == key_gen) return true;
+        }
+        return false;
+    }
+
+    // One frame. `key`: output w, h, network w, h, tone, structure; `wire`: teacher_format() of
+    // what is sent. Returns the kept frame to show now, with `head_srv`, or -1 while there is none.
+    int step(device* d, command_list* cmd, resource send_src, resource keep_src, teacher3::Header* hd,
+             const uint32_t (&key)[6], uint32_t wire) {
+        using namespace teacher3;
+        const double now = now_ms();
+        // the settings, under a new generation whenever they change: the bridge restarts on it
+        if (hd->key_gen == 0 || hd->ow != key[0] || hd->oh != key[1] || hd->nw != key[2] ||
+            hd->nh != key[3] || hd->tone != key[4] || hd->structure != key[5]) {
+            hd->ow = key[0]; hd->oh = key[1]; hd->nw = key[2]; hd->nh = key[3];
+            hd->tone = key[4]; hd->structure = key[5];
+            MemoryBarrier();
+            hd->key_gen = hd->key_gen + 1;
+        }
+        if (key_gen != hd->key_gen) {
+            key_gen = hd->key_gen;
+            for (uint32_t s = 0; s < kSlots; ++s) {
+                cas(&hd->slots[s].state, kFilled, kFree);
+                cas(&hd->slots[s].state, kDone, kFree);
+            }
+            forget_frames();
+        }
+
+        // (1) the newest output that has come back, when it is newer than the one on screen
+        int best = -1;
+        uint32_t best_seq = last_shown;
+        for (uint32_t s = 0; s < kSlots; ++s) {
+            const Slot& sl = hd->slots[s];
+            if (sl.state == kDone && sl.key_gen == key_gen && sl.seq > best_seq && ring_of(sl.seq) >= 0) {
+                best = int(s);
+                best_seq = sl.seq;
+            }
+        }
+        if (best >= 0 && cas(&hd->slots[best].state, kDone, kReading)) {
+            MemoryBarrier();
+            g.upload(d, cmd, out_slot(hd, uint32_t(best)), uint64_t(w) * h * 8, head);
+            hd->slots[best].state = kFree;
+            const int r = ring_of(best_seq);
+            const double behind = now - sent_at[r];
+            behind_ms = behind_ms == 0.0 ? behind : behind_ms * 0.9 + behind * 0.1;
+            if (last_show != 0.0)
+                every_ms = every_ms == 0.0 ? now - last_show : every_ms * 0.9 + (now - last_show) * 0.1;
+            last_show = now;
+            if (shown >= 0 && shown != r) seq_of[shown] = 0;
+            shown = r;
+            last_shown = best_seq;
+        }
+        // an output that came back after a newer one is dropped
+        for (uint32_t s = 0; s < kSlots; ++s) {
+            const Slot& sl = hd->slots[s];
+            if (sl.state == kDone && (sl.key_gen != key_gen || sl.seq <= last_shown))
+                cas(&hd->slots[s].state, kDone, kFree);
+        }
+        // and a kept frame that will not be shown -- older than the one on screen, or no longer with
+        // the bridge (passed over for a newer one, or lost with a GPU that failed) -- is let go
+        for (uint32_t q = 0; q < R; ++q)
+            if (int(q) != shown && int(q) != pending && seq_of[q] != 0 &&
+                (seq_of[q] < last_shown || !with_bridge(hd, seq_of[q])))
+                seq_of[q] = 0;
+
+        // (2) last frame's copy, to the bridge
+        if (pending >= 0) {
+            const int r = pending;
+            pending = -1;
+            subresource_data m{};
+            const bool landed = api != device_api::d3d12 || (fv[r] != 0 && d->wait(fnc, fv[r], 1000000000ull));
+            bool handed = false;
+            if (landed && d->map_texture_region(gstage[r], 0, nullptr, map_access::read_only, &m)) {
+                int s = -1;
+                for (uint32_t q = 0; q < kSlots && s < 0; ++q)
+                    if (cas(&hd->slots[q].state, kFree, kWriting)) s = int(q);
+                if (s < 0) {                         // or over the oldest frame no GPU has taken yet
+                    int old = -1;
+                    for (uint32_t q = 0; q < kSlots; ++q)
+                        if (hd->slots[q].state == kFilled && (old < 0 || hd->slots[q].seq < hd->slots[old].seq))
+                            old = int(q);
+                    if (old >= 0 && cas(&hd->slots[old].state, kFilled, kWriting)) {
+                        const int ro = ring_of(hd->slots[old].seq);
+                        if (ro >= 0 && ro != shown) seq_of[ro] = 0;
+                        s = old;
+                    }
+                }
+                if (s >= 0) {
+                    uint8_t* dst = in_slot(hd, uint32_t(s));
+                    for (uint32_t y = 0; y < oh; ++y) {
+                        const uint8_t* row = static_cast<const uint8_t*>(m.data) + size_t(y) * m.row_pitch;
+                        uint8_t* o = dst + size_t(y) * ow * 4;
+                        if (wire != 2) {
+                            std::memcpy(o, row, size_t(ow) * 4);
+                            continue;
+                        }
+                        for (uint32_t x = 0; x < ow; ++x, o += 4) {   // HDR: already sRGB-encoded, 0..1
+                            DirectX::PackedVector::HALF hv[3];
+                            std::memcpy(hv, row + size_t(x) * 8, 6);
+                            for (int k = 0; k < 3; ++k)
+                                o[k] = uint8_t(std::lround(
+                                    std::clamp(DirectX::PackedVector::XMConvertHalfToFloat(hv[k]), 0.0f, 1.0f) *
+                                    255.0f));
+                            o[3] = 255;
+                        }
+                    }
+                    Slot& sl = hd->slots[s];
+                    sl.seq = seq_of[r];
+                    sl.key_gen = key_gen;
+                    sl.ow = ow; sl.oh = oh;
+                    sl.fmt = wire == 2 ? 0u : wire;
+                    sl.pitch = ow * 4;
+                    sl.worker = 0;
+                    sl.t_filled = GetTickCount();
+                    MemoryBarrier();                  // the frame and its description, then the state
+                    sl.state = kFilled;
+                    handed = true;
+                }
+                d->unmap_texture_region(gstage[r], 0);
+            }
+            if (!handed) seq_of[r] = 0;
+        }
+
+        // (3) this frame, when the bridge is due one: at its pace, and only while a GPU is free for
+        // it. A frame waiting for a busy GPU would be shown that much later, so none is queued: the
+        // picture stays as close behind the game as the GPUs allow.
+        gpus = hd->nworkers;
+        const double pace = double(hd->pace_ms);
+        uint32_t inflight = 0;
+        for (uint32_t s = 0; s < kSlots; ++s) {
+            const uint32_t st = hd->slots[s].state;
+            if (st == kWriting || st == kFilled || st == kClaimed) ++inflight;
+        }
+        int r = -1;
+        for (uint32_t q = 0; q < R && r < 0; ++q)
+            if (seq_of[q] == 0 && int(q) != shown) r = int(q);
+        if (gpus >= 1 && r >= 0 && inflight < gpus && now - last_submit + 1.0 >= pace) {
+            g.use(cmd, send_src, resource_usage::copy_source);
+            g.use(cmd, keep_src, resource_usage::copy_source);
+            for (resource x : {gstage[r], frame[r]}) g.use(cmd, x, resource_usage::copy_dest);
+            cmd->copy_texture_region(send_src, 0, nullptr, gstage[r], 0, nullptr);
+            cmd->copy_texture_region(keep_src, 0, nullptr, frame[r], 0, nullptr);
+            if (api == device_api::d3d12) { fv[r] = 0; unsignaled = r; }
+            seq_of[r] = ++next_seq;
+            sent_at[r] = now;
+            pending = r;
+            last_submit = now;
+        }
+
+        // nothing new for a second -- every GPU restarting, say -- and the picture would stand
+        // still while the game goes on: OpenNR's own model takes over until one comes back
+        if (shown >= 0 && now - last_show > 1000.0) {
+            std::snprintf(g_teacher_note, sizeof g_teacher_note, "%s",
+                          "the teacher has not finished a frame for over a second");
+            return -1;
+        }
+        if (shown < 0)
+            std::snprintf(g_teacher_note, sizeof g_teacher_note, "%s",
+                          gpus == 0 ? "the teacher bridge is still starting"
+                                    : "waiting for the first frame to come back");
+        return shown;
+    }
+};
+Teacher3 g_t3;
+
+// Everything that can be decided without touching the GPU: the bridge speaks protocol 3, is alive,
+// and this process holds it.
+teacher3::Header* teacher3_wanted(device* d, uint32_t OW, uint32_t OH, format f) {
+    if (!g_teacher || g_proto != 3) {
+        if (g_t3view) teacher::release(&reinterpret_cast<teacher3::Header*>(g_t3view)->owner);
+        return nullptr;
+    }
+    const char* why = nullptr;
+    teacher3::Header* h = teacher3_header();
+    if (d->get_api() == device_api::vulkan)          why = "not available on Vulkan";
+    else if (g_bridge == kBridgeAbsent || !h)         why = "the teacher bridge is not running";
+    else if (g_bridge == kBridgeStopped)              why = "the teacher bridge stopped responding";
+    else if (const DWORD other = teacher::claim(&h->owner)) {
+        static char in_use[160];
+        char name[MAX_PATH];
+        teacher::process_name(other, name, sizeof name);
+        std::snprintf(in_use, sizeof in_use, "the teacher bridge is in use by %s", name);
+        why = in_use;
+    }
+    else if (teacher_format(f) == 0xffffffffu)        why = "this game's picture format is not supported";
+    else if (uint64_t(OW) * OH * 4 > teacher3::kInMax || uint64_t(g.w) * g.h * 8 > teacher3::kOutMax)
+        why = "the picture is larger than 4K";
+    if (why) {
+        std::snprintf(g_teacher_note, sizeof g_teacher_note, "%s", why);
+        return nullptr;
+    }
+    return h;
+}
+
+void signal_t3_copy(command_queue* q, bool flush) {
+    Teacher3& t = g_t3;
+    if (!q || !t.ok || t.unsignaled < 0 || !t.fnc.handle) return;
+    if (flush) q->flush_immediate_command_list();
+    q->signal(t.fnc, ++t.fval);
+    t.fv[t.unsignaled] = t.fval;
+    t.unsignaled = -1;
 }
 
 // ======================================================= the network on a GPU the player picks
@@ -1436,11 +1856,31 @@ bool correct_before_interface_d3d12(command_list* cmd, ListState& s) {
     return true;
 }
 
+// The game's frame rate, over half a second at a time, counted at present.
+std::atomic<double> g_fps{0.0};
+void count_frame() {
+    static double t0 = 0.0;
+    static uint32_t n = 0;
+    const double now = now_ms();
+    if (t0 == 0.0 || now - t0 > 5000.0) {       // the first frame, or after a long pause
+        t0 = now;
+        n = 0;
+        return;
+    }
+    ++n;
+    if (now - t0 >= 500.0) {
+        g_fps = double(n) * 1000.0 / (now - t0);
+        t0 = now;
+        n = 0;
+    }
+}
+
 void on_present(command_queue* queue, swapchain* sc, const rect*, const rect*, uint32_t, const rect*) {
     // the swap chain's buffers, refreshed every frame -- a resize replaces them
     device* const dev = sc->get_device();
     g_color_space = sc->get_color_space();          // SDR, scRGB or HDR10
-    if (g_experimental && (g_teacher || GetTickCount64() - g_overlay_tick.load() < 2000)) bridge_poll();
+    if (g_teacher || GetTickCount64() - g_overlay_tick.load() < 2000) bridge_poll();
+    count_frame();
     g_d3d12 = dev->get_api() == device_api::d3d12;
     const uint32_t n = std::min<uint32_t>(sc->get_back_buffer_count(), 8);
     for (uint32_t i = 0; i < n; ++i) g_bb[i].store(sc->get_back_buffer(i).handle, std::memory_order_relaxed);
@@ -1455,6 +1895,7 @@ void on_present(command_queue* queue, swapchain* sc, const rect*, const rect*, u
     {
         std::lock_guard<std::mutex> lk(g_frame_mutex);
         signal_remote_copy(queue, false);
+        signal_t3_copy(queue, false);
     }
     // what the frame now ending did, for the overlay, and each change of it in ReShade.log
     {
@@ -1721,11 +2162,34 @@ void finish_effects_locked(effect_runtime* rt, command_list* cmd, resource_view 
     }
 
     // The teacher model (experimental), switched on and its bridge ready: the frame -- on HDR, as
-    // the network is shown it -- goes out, and its output comes back for the composite. Not inside
-    // a game's own D3D12 list, which cannot be waited on; `g_teacher_ready` moves the next frame
-    // to present instead.
+    // the network is shown it -- goes out, and its output comes back for the composite.
     const format teach_fmt = hdr ? format::r16g16b16a16_float : target_fmt;
-    const bool teacher_ok = teacher_wanted(d, OW, OH, teach_fmt);
+    // Protocol 3, when the bridge offers it: the frame is handed over and the game goes on; what is
+    // shown is the newest kept frame whose output has come back (Teacher3). Built on first use and
+    // again whenever what it was built for changes; a build that fails is not retried until then.
+    teacher3::Header* const h3 = teacher3_wanted(d, OW, OH, teach_fmt);
+    int t3_slot = -1;
+    if (h3) {
+        Teacher3& t = g_t3;
+        const bool stale = t.w != g.w || t.h != g.h || t.ow != OW || t.oh != OH ||
+                           t.send_fmt != teach_fmt || t.keep_fmt != target_fmt;
+        if (stale || (!t.ok && !t.tried)) t.build(d, g.w, g.h, OW, OH, teach_fmt, target_fmt);
+        if (t.ok) {
+            const uint32_t key[6] = {OW, OH, g.w, g.h, g_tone, g_structure};
+            t3_slot = t.step(d, cmd, hdr ? g.proxy : g.src_copy, g.src_copy, h3, key,
+                             teacher_format(teach_fmt));
+            // at present this is ReShade's own list, submitted here so the fence can follow it;
+            // before the HUD it is the game's, and the fence goes in at the present event
+            if (g.api == device_api::d3d12 && !g_in_preui) signal_t3_copy(rt->get_command_queue(), true);
+        }
+    } else if (g_t3.ok || g_t3.tried) {
+        g_t3.destroy(d);
+        g_t3.tried = false;
+    }
+    const bool t3_now = t3_slot >= 0;
+    // Protocol 2: the game waits for the output. Not inside a game's own D3D12 list, which cannot
+    // be waited on; `g_teacher_ready` moves the next frame to present instead.
+    const bool teacher_ok = !h3 && teacher_wanted(d, OW, OH, teach_fmt);
     g_teacher_ready = teacher_ok;
     bool teacher_now = false;
     if (teacher_ok && !(g_in_preui && g.api != device_api::d3d11)) {
@@ -1737,7 +2201,7 @@ void finish_effects_locked(effect_runtime* rt, command_list* cmd, resource_view 
     } else if (teacher_ok) {
         std::snprintf(g_teacher_note, sizeof g_teacher_note, "%s", "waiting for the next frame");
     }
-    g_teacher_active = teacher_now;
+    g_teacher_active = teacher_now || t3_now;
 
     // The network on another GPU, when the player picked one. Built on first use and again
     // whenever what it was built for changes; a build that fails is not retried until something
@@ -1748,7 +2212,7 @@ void finish_effects_locked(effect_runtime* rt, command_list* cmd, resource_view 
     const bool remote_api = g.api == device_api::d3d11 || g.api == device_api::d3d12;
     // the output group for the style, when the model has one output per style
     const uint32_t group = g.net.cout >= 12 ? (g_model < 2u ? g_model : 2u) : 0u;
-    if (!teacher_now && g_net_gpu_idx >= 0 && remote_api && !hdr) {
+    if (!teacher_now && !h3 && g_net_gpu_idx >= 0 && remote_api && !hdr) {
         Remote& r = g_remote;
         const bool stale = r.adapter != g_net_gpu_idx || r.model != g_model_idx || r.w != g.w ||
                            r.h != g.h || r.ow != OW || r.oh != OH || r.fmt != target_fmt;
@@ -1768,7 +2232,7 @@ void finish_effects_locked(effect_runtime* rt, command_list* cmd, resource_view 
     if (g_net_gpu_idx >= 0 && hdr)
         std::snprintf(g_remote_note, sizeof g_remote_note, "%s",
                       "a second GPU is not supported with HDR output yet -- running on the game's GPU");
-    if (g_net_gpu_idx >= 0 && teacher_now)
+    if (g_net_gpu_idx >= 0 && (teacher_now || h3))
         std::snprintf(g_remote_note, sizeof g_remote_note, "%s", "paused while the teacher model runs");
 
     // the network's inputs: Local Tone and Local Structure, as fp32 bits of percent / 100 (see
@@ -1780,7 +2244,7 @@ void finish_effects_locked(effect_runtime* rt, command_list* cmd, resource_view 
         // at present this is ReShade's own list, submitted here so the fence can follow it;
         // before the HUD it is the game's, and the fence goes in at the present event
         if (g.api == device_api::d3d12 && !g_in_preui) signal_remote_copy(rt->get_command_queue(), true);
-    } else if (!teacher_now) {            // the teacher's output is already on its way up
+    } else if (!teacher_now && !t3_now) {  // the teacher's output is already on its way up
         // 1. the 16 input channels, at the network's resolution
         go2d(g.stage_pso, hdr ? g.proxy_srv : src_srv, {}, g.chans_uav, stage_args, g.w, g.h);
 
@@ -1902,9 +2366,12 @@ void finish_effects_locked(effect_runtime* rt, command_list* cmd, resource_view 
     // that output arrives packed, one group of four channels a pixel.
     // The teacher's output arrives packed the same way. A frame being saved is composited as the
     // plain final frame, whatever View and Compare say.
-    const bool packed = teacher_now || remote_now;
-    const resource_view comp_src = remote_now ? g_remote.frame_srv[remote_slot] : src_srv;
+    const bool packed = teacher_now || t3_now || remote_now;
+    const resource_view comp_src = remote_now ? g_remote.frame_srv[remote_slot]
+                                   : t3_now   ? g_t3.frame_srv[t3_slot]
+                                              : src_srv;
     const resource_view comp_head = teacher_now  ? g.teacher_head_srv
+                                    : t3_now     ? g_t3.head_srv
                                     : remote_now ? g_remote.head_srv
                                                  : g.head_srv;
     const uint32_t head_stride = packed ? 4u : g.net.convs.back().pad;
@@ -1927,14 +2394,16 @@ void finish_effects_locked(effect_runtime* rt, command_list* cmd, resource_view 
         opennr::views::Info info;
         info.version = kVersion;
         info.model = kModelLabels[g_model_idx];
-        info.network = teacher_now ? std::string("the teacher model (experimental)")
+        info.network = teacher_now || t3_now ? std::string("the teacher model (experimental)")
                        : remote_now ? g_remote.name : std::string("the game's GPU");
         info.strength = g_strength; info.tone = g_tone; info.structure = g_structure;
         info.style = g_model; info.detail = g_detail; info.colour = g_colour; info.apply = g_apply;
         info.hdr = hdr; info.white = g_white;
         info.head_group = packed ? 0u : group;
-        save_record(d, cmd, remote_now ? g_remote.frame[remote_slot] : g.src_copy,
-                    teacher_now ? g.teacher_head : remote_now ? g_remote.head : g.head, head_stride, info);
+        save_record(d, cmd,
+                    remote_now ? g_remote.frame[remote_slot] : t3_now ? g_t3.frame[t3_slot] : g.src_copy,
+                    teacher_now ? g.teacher_head : t3_now ? g_t3.head : remote_now ? g_remote.head : g.head,
+                    head_stride, info);
     }
 
     end_timing();
@@ -1968,9 +2437,6 @@ void read_config() {
     v = 250;
     reshade::get_config_value(nullptr, "OpenNR", "WhitePoint", v);
     g_white = v < 25 ? 25 : (v > 10000 ? 10000 : v);
-    v = 0;
-    reshade::get_config_value(nullptr, "OpenNR", "Experimental", v);
-    g_experimental = v == 1 ? 1u : 0u;
     v = 0;
     reshade::get_config_value(nullptr, "OpenNR", "Teacher", v);
     g_teacher = v ? 1u : 0u;
@@ -2207,8 +2673,7 @@ void on_overlay(effect_runtime* rt) {
         ImGui::TextUnformatted("Setup failed -- see ReShade.log. The frame is left untouched.");
     }
 
-    // ---- experimental, only with Experimental=1 in ReShade.ini
-    if (!g_experimental) return;
+    // ---- experimental
     g_overlay_tick = GetTickCount64();            // the bridge is polled while this is open
     ImGui::Separator();
     ImGui::TextUnformatted("Experimental");
@@ -2217,10 +2682,15 @@ void on_overlay(effect_runtime* rt) {
         g_teacher = teach ? 1u : 0u;
         reshade::set_config_value(nullptr, "OpenNR", "Teacher", g_teacher);
         // switched off: the bridge is free for another program
-        if (!g_teacher && g_tview) teacher::release(reinterpret_cast<teacher::Header*>(g_tview));
+        if (!g_teacher) teacher_release_all();
     }
     const int bridge = g_bridge.load();
-    if (bridge == kBridgeReady && g_teacher_active)
+    const bool three = g_proto == 3;
+    if (bridge == kBridgeReady && g_teacher_active && three)
+        ImGui::TextWrapped("Teacher bridge: running on %u GPU%s -- a new picture every %.0f ms, "
+                           "%.0f ms behind the game", g_t3.gpus, g_t3.gpus == 1 ? "" : "s",
+                           g_t3.every_ms, g_t3.behind_ms);
+    else if (bridge == kBridgeReady && g_teacher_active)
         ImGui::Text("Teacher bridge: running, %.0f ms a frame (%.0f ms in the model)", g_teacher_wall,
                     g_teacher_ms);
     else if (bridge == kBridgeReady)
@@ -2237,10 +2707,20 @@ void on_overlay(effect_runtime* rt) {
                            g_teacher_note[0] ? g_teacher_note : "the teacher bridge is not running");
         ImGui::PopStyleColor();
     }
-    ImGui::TextDisabled("%s", "(the large model OpenNR's models are trained to imitate. It runs in\n"
-                        " the OpenNR teacher bridge, a separate program, and the game waits for\n"
-                        " every frame -- expect a few frames a second. On D3D12 it corrects the\n"
-                        " whole frame, HUD included.)");
+    // the game's own frame rate, to see what the teacher costs it
+    if (const double fps = g_fps.load(); fps > 0.0)
+        ImGui::Text("The game: %.0f fps (%.1f ms a frame)", fps, 1000.0 / fps);
+    if (three)
+        ImGui::TextDisabled("%s", "(the large model OpenNR's models are trained to imitate. It runs in\n"
+                            " the OpenNR teacher bridge, a separate program, on one GPU or more.\n"
+                            " The game keeps running: what you see is the newest frame the teacher\n"
+                            " has finished, a little behind the game, and it changes as often as\n"
+                            " the teacher finishes one.)");
+    else
+        ImGui::TextDisabled("%s", "(the large model OpenNR's models are trained to imitate. It runs in\n"
+                            " the OpenNR teacher bridge, a separate program, and the game waits for\n"
+                            " every frame -- expect a few frames a second. On D3D12 it corrects the\n"
+                            " whole frame, HUD included.)");
 }
 
 void on_destroy_runtime(effect_runtime* rt) {
@@ -2249,6 +2729,8 @@ void on_destroy_runtime(effect_runtime* rt) {
     release_blank_state();
     if (g.dev) g_remote.destroy(g.dev);   // its game-side copies live on this device too
     g_remote.tried = false;
+    if (g.dev) g_t3.destroy(g.dev);       // and the teacher's kept frames
+    g_t3.tried = false;
     if (g_save.dev == rt->get_device()) {
         save_drop();                      // a save still in flight is dropped
         g_save.dev = nullptr;
@@ -2294,11 +2776,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         break;
     case DLL_PROCESS_DETACH:
         reshade::unregister_addon(hModule);
-        if (g_tview) {                              // the teacher bridge's mapping, if it was opened
-            teacher::release(reinterpret_cast<teacher::Header*>(g_tview));
-            UnmapViewOfFile(g_tview);
-        }
+        teacher_release_all();                      // the teacher bridge's mappings, if opened
+        if (g_tview) UnmapViewOfFile(g_tview);
         if (g_tmap) CloseHandle(g_tmap);
+        if (g_t3view) UnmapViewOfFile(g_t3view);
+        if (g_t3map) CloseHandle(g_t3map);
         break;
     }
     return TRUE;

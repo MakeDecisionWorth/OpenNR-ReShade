@@ -3,7 +3,7 @@
 OpenNR is a ReShade add-on that runs a small neural network on your game's picture, every frame.
 It re-balances local tone, local contrast and colour for a more natural, photographic look.
 
-Version 0.2.0.
+Version 0.2.1.
 
 ## What you need
 
@@ -51,6 +51,23 @@ To install by hand instead, copy `opennr.addon64` and the `OpenNR` folder next t
 | **GPU time** | How long OpenNR takes on your GPU each frame, and the amount of work (GMAC). |
 
 Settings are saved in `ReShade.ini` under `[OpenNR]`, except Apply the model, View and Compare.
+
+### Experimental: the teacher model
+
+At the bottom of OpenNR's settings, **Use the teacher model** shows what the large model OpenNR's
+own models are trained to imitate does to your game. It runs in
+[DLSSNR SYCL Bridge](https://github.com/MakeDecisionWorth/DLSSNR-SYCL-Bridge), a separate program
+for Intel Arc GPUs; see its README to set it up.
+
+The game keeps running at its own pace. What you see is the newest frame the teacher has
+finished, with its correction, a little behind the game: about 12 new pictures a second on one
+Arc A750, and more with two GPUs taking turns. The line under the checkbox shows the bridge — *not
+running*, *starting*, or *running* with how often a new picture arrives and how far it is behind
+the game — and the next line shows the game's own frame rate, so you can see what the teacher
+costs it. Until the first frame comes back, and whenever the bridge isn't there, OpenNR's own model
+corrects the picture, and a red line says why.
+
+It is for looking and comparing, not for playing.
 
 ## Uninstall
 

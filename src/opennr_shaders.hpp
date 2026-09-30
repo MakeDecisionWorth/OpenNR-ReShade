@@ -233,25 +233,33 @@ void main(uint3 id : SV_DispatchThreadID) {
 )";
 
 // The network's correction on the frame, lifted back to the output resolution, with Strength,
-// the Model B/C colour grade, and the view.
+// the Natural/Cinematic colour grade, Detail and Colour strength, Compare, and the view -- on an
+// SDR or an HDR swap chain.
 inline const char* kCompositeHLSL = R"(
 Texture2D<float4>          src  : register(t0);
 StructuredBuffer<uint2>    head : register(t1);
 RWTexture2D<float4>        dst  : register(u0);
 
 // gHeadStride: how wide the network's output buffer is per pixel, in halves.
-// gHeadGroup: which four channels of it to read -- the model has one output per Model A/B/C.
-// gGrade: bits 0-1 the model (0 A, 1 B, 2 C), bits 8-15 Local Tone in percent, capped at 100.
+// gHeadGroup: which four channels of it to read -- the model has one output per Style.
+// gGrade: bits 0-1 the style (0 Standard, 1 Natural, 2 Cinematic), bits 8-15 Local Tone in
+//   percent, capped at 100.
+// gDetail, gColour: Detail and Colour strength. gApply 0: the frame goes out as it came in.
+// gCompare: 1 side by side (gZoom 1-2), 2 a split line at gSplit (0-1); gSwap puts the corrected
+//   picture on the left.
+// gHdr: the swap chain, 0 SDR, 1 scRGB, 2 HDR10; gWhite the white point (1.0 = 80 nits).
+// gDetail, gColour, gSplit, gZoom and gWhite are fp32 bits.
 cbuffer Args : register(b0) {
-    uint gW, gH, gOW, gOH, gStrength, gHeadStride, gView, gHeadGroup, gGrade;
+    uint gW, gH, gOW, gOH, gStrength, gHeadStride, gView, gHeadGroup, gGrade, gDetail, gColour,
+         gApply, gCompare, gSplit, gZoom, gSwap, gHdr, gWhite, gPad0, gPad1;
 };
 
-// ---- the Model B/C colour grade. Each model is 14 fields; a field is scaled from its default
-// toward the model's value by Local Tone (up to 100%).
+// ---- the Natural/Cinematic colour grade. Each style is 14 fields; a field is scaled from its
+// default toward the style's value by Local Tone (up to 100%).
 static const float kGradeField[3][14] = {
-    {0.0, 1.0,  0.0, 0.0,  0.0,   0.0,  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},   // A
-    {0.0, 1.0, -0.1, 0.0, -0.25, -0.1,  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},   // B
-    {0.0, 1.0,  0.0, 0.0,  0.0,  -0.15, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};  // C
+    {0.0, 1.0,  0.0, 0.0,  0.0,   0.0,  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},   // Standard
+    {0.0, 1.0, -0.1, 0.0, -0.25, -0.1,  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},   // Natural
+    {0.0, 1.0,  0.0, 0.0,  0.0,  -0.15, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};  // Cinematic
 
 float grade_smooth(float x) { return x * x * (3.0 - 2.0 * x); }
 
@@ -330,42 +338,153 @@ float3 grade(float3 n, uint style, float tone) {
     return saturate(grade_hsl2rgb(hsl));
 }
 
+// ---- HDR. The network works on a display picture: on SDR the frame itself, on HDR the frame in
+// linear BT.709 (1.0 = 80 nits) over the white point, sRGB-encoded -- what kEncodeHLSL writes.
+// Its correction goes back as a change in linear light, so a pixel it does not change is left
+// exactly as the game drew it, highlights above the white point and wide-gamut colour included.
+static const float3x3 kBt709To2020 = {0.6274040, 0.3292820, 0.0433136,
+                                      0.0690970, 0.9195400, 0.0113612,
+                                      0.0163916, 0.0880132, 0.8955950};
+static const float3x3 kBt2020To709 = { 1.6604910, -0.5876411, -0.0728499,
+                                      -0.1245505,  1.1328999, -0.0083494,
+                                      -0.0181508, -0.1005789,  1.1187297};
+float3 srgb_to_linear(float3 v) {
+    v = saturate(v);
+    return lerp(v / 12.92, pow((v + 0.055) / 1.055, 2.4), step(0.04045, v));
+}
+float3 srgb_encode(float3 v) {
+    v = saturate(v);
+    return lerp(v * 12.92, 1.055 * pow(v, 1.0 / 2.4) - 0.055, step(0.0031308, v));
+}
+float3 pq_decode(float3 e) {       // SMPTE ST 2084 to nits / 10000
+    const float3 p = pow(saturate(e), 1.0 / 78.84375);
+    return pow(max(p - 0.8359375, 0.0) / (18.8515625 - 18.6875 * p), 1.0 / 0.1593017578125);
+}
+float3 pq_encode(float3 y) {
+    const float3 p = pow(saturate(y), 0.1593017578125);
+    return pow((0.8359375 + 18.8515625 * p) / (1.0 + 18.6875 * p), 78.84375);
+}
+float3 hdr_to_linear(float3 v) { return gHdr == 2 ? mul(kBt2020To709, pq_decode(v) * 125.0) : v; }
+float3 linear_to_hdr(float3 x) { return gHdr == 2 ? pq_encode(mul(kBt709To2020, x) * 0.008) : x; }
+float3 to_display(float3 v) {
+    return gHdr == 0 ? v : srgb_encode(saturate(hdr_to_linear(v) / asfloat(gWhite)));
+}
+// a display value out to the swap chain; on HDR at the white point
+float4 emit(float3 v, float a) {
+    return gHdr == 0 ? float4(v, a) : float4(linear_to_hdr(asfloat(gWhite) * srgb_to_linear(v)), a);
+}
+// the corrected pixel: `raw` as the game drew it, `sd` its display value, `corr` the correction
+float4 finish(float4 raw, float3 sd, float3 corr) {
+    if (gHdr == 0) return float4(saturate(sd + corr), raw.a);
+    return float4(linear_to_hdr(hdr_to_linear(raw.rgb) + asfloat(gWhite) *
+                                (srgb_to_linear(saturate(sd + corr)) - srgb_to_linear(sd))), raw.a);
+}
+
 float3 fetch(uint x, uint y) {
     const uint2 v = head[(y * gW + x) * (gHeadStride / 4) + gHeadGroup];
     return float3(f16tof32(v.x), f16tof32(v.x >> 16), f16tof32(v.y));
 }
 
-[numthreads(8, 8, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= gOW || id.y >= gOH) return;
-    const float4 s = src.Load(int3(id.xy, 0));
+// the network's output at an output position (pixel centres at +0.5), bilinear when the network
+// runs smaller than the frame
+float3 head_at(float2 pos) {
+    if (gW == gOW && gH == gOH) return fetch(min(uint(pos.x), gW - 1), min(uint(pos.y), gH - 1));
+    const float fx = pos.x * (float(gW) / float(gOW)) - 0.5;
+    const float fy = pos.y * (float(gH) / float(gOH)) - 0.5;
+    const int x0 = int(floor(fx)), y0 = int(floor(fy));
+    const float wx = fx - float(x0), wy = fy - float(y0);
+    const uint xc = uint(clamp(x0, 0, int(gW) - 1)), x1 = uint(clamp(x0 + 1, 0, int(gW) - 1));
+    const uint yc = uint(clamp(y0, 0, int(gH) - 1)), y1 = uint(clamp(y0 + 1, 0, int(gH) - 1));
+    return lerp(lerp(fetch(xc, yc), fetch(x1, yc), wx), lerp(fetch(xc, y1), fetch(x1, y1), wx), wy);
+}
 
-    float3 h;
-    if (gW == gOW && gH == gOH) {
-        h = fetch(id.x, id.y);
-    } else {
-        const float fx = (float(id.x) + 0.5) * (float(gW) / float(gOW)) - 0.5;
-        const float fy = (float(id.y) + 0.5) * (float(gH) / float(gOH)) - 0.5;
-        const int x0 = int(floor(fx)), y0 = int(floor(fy));
-        const float wx = fx - float(x0), wy = fy - float(y0);
-        const uint xc = uint(clamp(x0, 0, int(gW) - 1)), x1 = uint(clamp(x0 + 1, 0, int(gW) - 1));
-        const uint yc = uint(clamp(y0, 0, int(gH) - 1)), y1 = uint(clamp(y0 + 1, 0, int(gH) - 1));
-        h = lerp(lerp(fetch(xc, yc), fetch(x1, yc), wx),
-                 lerp(fetch(xc, y1), fetch(x1, y1), wx), wy);
-    }
-    // Model A: frame + correction. Model B/C: the corrected frame graded, blended back onto the
-    // frame by Strength.
+// the frame at an output position, bilinear (the side-by-side halves read between pixels)
+float4 src_at(float2 pos) {
+    const float fx = pos.x - 0.5, fy = pos.y - 0.5;
+    const int x0 = int(floor(fx)), y0 = int(floor(fy));
+    const float wx = fx - float(x0), wy = fy - float(y0);
+    const int xc = clamp(x0, 0, int(gOW) - 1), x1 = clamp(x0 + 1, 0, int(gOW) - 1);
+    const int yc = clamp(y0, 0, int(gOH) - 1), y1 = clamp(y0 + 1, 0, int(gOH) - 1);
+    return lerp(lerp(src.Load(int3(xc, yc, 0)), src.Load(int3(x1, yc, 0)), wx),
+                lerp(src.Load(int3(xc, y1, 0)), src.Load(int3(x1, y1, 0)), wx), wy);
+}
+
+// Standard: frame + correction. Natural/Cinematic: the corrected frame graded, blended back onto
+// the frame by Strength. Then Detail scales all of it and Colour the part that is not luminance.
+float3 correction(float3 s, float3 h) {
     float3 corr = 0.25 * h * (float(gStrength) / 100.0);
     const uint style = min(gGrade & 3u, 2u);
     if (style != 0) {
         const float tone = float(min((gGrade >> 8) & 0xffu, 100u)) / 100.0;
-        corr = (grade(saturate(s.rgb + 0.25 * h), style, tone) - s.rgb) * (float(gStrength) / 100.0);
+        corr = (grade(saturate(s + 0.25 * h), style, tone) - s) * (float(gStrength) / 100.0);
+    }
+    const float Y = dot(corr, float3(0.2126, 0.7152, 0.0722));
+    return asfloat(gDetail) * (Y + asfloat(gColour) * (corr - Y));
+}
+
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= gOW || id.y >= gOH) return;
+    const float4 raw = src.Load(int3(id.xy, 0));
+    const float4 s = float4(to_display(raw.rgb), raw.a);
+
+    // Compare, on the final frame: the picture cut at a split line, or both side by side, each
+    // the whole frame at half size (letterboxed at zoom 1, filling its half at zoom 2)
+    if (gView == 0 && gCompare != 0) {
+        const float2 uv = (float2(id.xy) + 0.5) / float2(gOW, gOH);
+        const float edge = gCompare == 2 ? asfloat(gSplit) : 0.5;
+        if (abs(uv.x - edge) < 1.0 / float(gOW)) { dst[id.xy] = emit(float3(0.5, 0.5, 0.5), s.a); return; }
+        const bool left = uv.x < edge;
+        float2 pos = float2(id.xy) + 0.5;
+        float4 r = raw;
+        float3 sd = s.rgb;
+        if (gCompare == 1) {
+            const float2 hv = float2(left ? uv.x * 2.0 : uv.x * 2.0 - 1.0, uv.y) - 0.5;
+            const float zoom = max(asfloat(gZoom), 1.0);
+            const float2 cuv = 0.5 + float2(hv.x, hv.y * 2.0) / zoom;
+            if (any(cuv < 0.0) || any(cuv > 1.0)) { dst[id.xy] = emit(float3(0.0, 0.0, 0.0), s.a); return; }
+            pos = cuv * float2(gOW, gOH);
+            r = float4(src_at(pos).rgb, s.a);
+            sd = to_display(r.rgb);
+        }
+        dst[id.xy] = (left != (gSwap != 0)) || gApply == 0 ? r : finish(r, sd, correction(sd, head_at(pos)));
+        return;
     }
     // gView: 0 the final frame; 1 the correction at 20x, centred on mid-grey (grey is unchanged,
     // brighter is added, darker is taken away); 2 the frame exactly as OpenNR reads it.
-    if (gView == 2)      dst[id.xy] = float4(s.rgb, 1.0);
-    else if (gView == 1) dst[id.xy] = float4(saturate(0.5 + 20.0 * corr), s.a);
-    else                 dst[id.xy] = float4(saturate(s.rgb + corr), s.a);
+    const float3 corr = correction(s.rgb, head_at(float2(id.xy) + 0.5));
+    if (gView == 2)      dst[id.xy] = emit(s.rgb, 1.0);
+    else if (gView == 1) dst[id.xy] = emit(saturate(0.5 + 20.0 * corr), s.a);
+    else                 dst[id.xy] = gApply != 0 ? finish(raw, s.rgb, corr) : raw;
+}
+)";
+
+// HDR swap chains only: the frame as the network is shown it, once a frame -- linear BT.709
+// (1.0 = 80 nits) over the white point, sRGB-encoded. The same conversion as the composite's
+// to_display.
+inline const char* kEncodeHLSL = R"(
+Texture2D<float4>   src : register(t0);
+RWTexture2D<float4> dst : register(u0);
+cbuffer Args : register(b0) { uint gOW, gOH, gHdr, gWhite; };
+
+static const float3x3 kBt2020To709 = { 1.6604910, -0.5876411, -0.0728499,
+                                      -0.1245505,  1.1328999, -0.0083494,
+                                      -0.0181508, -0.1005789,  1.1187297};
+float3 pq_decode(float3 e) {
+    const float3 p = pow(saturate(e), 1.0 / 78.84375);
+    return pow(max(p - 0.8359375, 0.0) / (18.8515625 - 18.6875 * p), 1.0 / 0.1593017578125);
+}
+float3 srgb_encode(float3 v) {
+    v = saturate(v);
+    return lerp(v * 12.92, 1.055 * pow(v, 1.0 / 2.4) - 0.055, step(0.0031308, v));
+}
+
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= gOW || id.y >= gOH) return;
+    const float3 v = src.Load(int3(id.xy, 0)).rgb;
+    const float3 x = gHdr == 2 ? mul(kBt2020To709, pq_decode(v) * 125.0) : v;
+    dst[id.xy] = float4(srgb_encode(saturate(x / asfloat(gWhite))), 1.0);
 }
 )";
 

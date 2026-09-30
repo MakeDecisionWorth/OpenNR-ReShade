@@ -61,6 +61,8 @@ if ($Uninstall) {
         Remove-Item -LiteralPath $models -Force
     }
     if ($removed) { Say "OpenNR removed. Its settings stay in ReShade.ini under [OpenNR]." "Green" }
+    $saved = Join-Path $models "Saved views"
+    if (Test-Path -LiteralPath $saved) { Say "Your saved views are kept in $saved." }
     else { Say "OpenNR is not installed in this folder." "Yellow" }
     Finish 0
 }

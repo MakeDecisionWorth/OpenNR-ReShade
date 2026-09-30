@@ -82,8 +82,9 @@ struct Network {
         if (!step) step = &dummy;
         // on Vulkan every buffer is a storage buffer, read-only ones included
         const bool vk = d->get_api() == device_api::vulkan;
+        // a copy source as well, so Save views can read the network's output back
         resource_desc rd(count * stride, memory_heap::gpu_only,
-                         resource_usage::shader_resource |
+                         resource_usage::shader_resource | resource_usage::copy_source |
                              ((uav || vk) ? resource_usage::unordered_access
                                           : resource_usage::undefined));
         rd.buffer.structured.stride = stride;
